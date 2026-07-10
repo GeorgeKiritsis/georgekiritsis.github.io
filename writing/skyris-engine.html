@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Architecture of Skyris: a Real-Time Flight Replay Engine &middot; Georgios Kiritsis</title>
+<meta name="description" content="The design of Skyris, a custom C++20/OpenGL engine that reconstructs a training flight over its real terrain: ECS, a platform abstraction layer, PBR, quadtree LOD terrain, and deterministic replay.">
+<meta name="author" content="Georgios Kiritsis">
+
+<meta property="og:title" content="Architecture of Skyris: a Real-Time Flight Replay Engine">
+<meta property="og:description" content="ECS, platform abstraction, physically based rendering, quadtree terrain, and deterministic replay in a custom C++20/OpenGL engine.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://georgekiritsis.com/writing/skyris-engine.html">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Crimson+Pro:ital,wght@0,400;0,600;1,400&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="../style.css">
+
+<script>
+  (function() {
+    const stored = localStorage.getItem('theme');
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const theme = stored || (systemDark ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
+</head>
+<body>
+
+<button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+  <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+  </svg>
+  <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+  </svg>
+</button>
+
+<div class="container article-container">
+
+  <a class="back-link" href="index.html">&larr; Writing</a>
+
+  <article class="article">
+
+    <header class="article-header">
+      <h1 class="article-title">Architecture of Skyris: a Real-Time Flight Replay Engine</h1>
+      <p class="article-meta">2026 &middot; ~14 min read</p>
+    </header>
+
+    <div class="article-body">
+
+      <p>Skyris is a 3D engine I wrote from scratch in C++20 and OpenGL to reconstruct a training flight over the real terrain it happened on. Given a CSV of telemetry from a custom flight recorder, it places the aircraft in a geographically accurate world, replays the flight with faithful attitude and trajectory, and overlays a machine-learning grade on each phase. It runs at a steady 60 Hz on an Apple M1 with 8 GB of RAM, terrain and all.</p>
+
+      <p>The reasonable question is why build an engine instead of using Unity or Unreal. The answer is integration. A commercial engine would have handed me terrain, physics, and scripting for free, but the flight-replay subsystem is the reason the whole thing exists, and I wanted it to be a first-class citizen wired into every layer, from the entity system up to the ML pipeline, rather than a plugin bolted onto a closed framework. This note walks through the architectural choices that made that possible.</p>
+
+
+      <figure class="figure">
+        <div class="figure-frame" style="padding:0;overflow:hidden;border-radius:8px;">
+          <img src="assets/preview.png" alt="The Skyris Editor with viewport, scene hierarchy, and panels" style="display:block;width:100%;height:auto;">
+        </div>
+        <figcaption>The Skyris Editor: viewport, scene hierarchy, content browser, and flight-analysis panels.</figcaption>
+      </figure>
+
+      <h2>The layered architecture</h2>
+
+      <p>Skyris is organised as a set of layers with strict, one-directional dependencies. Nothing above reaches around a layer to touch the one below it. The engine is a static library; the editor is a separate application that links against it and knows nothing of the graphics API underneath.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 340" role="img" aria-label="Layered architecture of Skyris from OS up to the editor, with an event bus on the side.">
+            <g font-size="12">
+              <!-- editor -->
+              <rect x="40" y="24" width="520" height="52" rx="8" class="d-accent-box"/>
+              <text x="300" y="46" text-anchor="middle" class="t-accent" font-weight="600" font-size="13">Editor application (Skyris-Editor)</text>
+              <text x="300" y="64" text-anchor="middle" class="t-soft" font-size="10.5">ImGui panels &#183; scene hierarchy &#183; flight analysis &#183; Lua scripting</text>
+
+              <!-- scene / ECS -->
+              <rect x="40" y="92" width="520" height="52" rx="8" class="d-box"/>
+              <text x="300" y="114" text-anchor="middle" class="t" font-weight="600" font-size="13">Scene &amp; ECS (EnTT registry)</text>
+              <text x="300" y="132" text-anchor="middle" class="t-muted" font-size="10.5">entities &#183; components &#183; systems &#183; serialization &#183; physics (Jolt)</text>
+
+              <!-- renderer -->
+              <rect x="40" y="160" width="520" height="52" rx="8" class="d-box"/>
+              <text x="300" y="182" text-anchor="middle" class="t" font-weight="600" font-size="13">Renderer (2D / 3D)</text>
+              <text x="300" y="200" text-anchor="middle" class="t-muted" font-size="10.5">PBR &#183; IBL &#183; terrain &#183; skybox &#183; batch rendering &#183; camera / frustum</text>
+
+              <!-- PAL -->
+              <rect x="40" y="228" width="520" height="52" rx="8" class="d-box"/>
+              <text x="300" y="250" text-anchor="middle" class="t" font-weight="600" font-size="13">Platform Abstraction Layer</text>
+              <text x="300" y="268" text-anchor="middle" class="t-muted" font-size="10.5">Window &#183; Input &#183; RendererAPI &#183; Buffers &#183; Shader &#183; Texture &#183; Framebuffer</text>
+
+              <!-- OS strip -->
+              <rect x="40" y="296" width="520" height="34" rx="8" class="d-card"/>
+              <text x="300" y="317" text-anchor="middle" class="t-soft" font-size="11">OpenGL &#183; GLFW &#183; operating system</text>
+
+              <!-- event bus -->
+              <rect x="586" y="24" width="94" height="256" rx="8" class="d-accent-box"/>
+              <text x="633" y="150" text-anchor="middle" class="t-accent" font-weight="600" font-size="12" transform="rotate(-90 633 150)">Event system</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>Each layer depends only on the one below it. The event system runs alongside as a decoupled bus: a window resize or key press is emitted once and travels up through the layers, so the window never needs to know that a renderer or an editor exists.</figcaption>
+      </figure>
+
+      <p>The payoff of this discipline is portability and testability. Adding a Vulkan backend would mean implementing the platform abstraction classes in a new folder and touching nothing else. The engine could equally drive a headless flight-analysis tool with no editor at all. The event system enforces the decoupling: producers emit events, consumers subscribe, and no module holds a direct reference to another.</p>
+
+      <h2>Entity-Component-System instead of an inheritance tree</h2>
+
+      <p>The traditional object-oriented engine builds deep inheritance hierarchies: a <code>GameObject</code> extends an <code>Actor</code> extends a <code>SceneNode</code>. That produces tight coupling, painful extension, and poor cache behaviour, because each object's data is scattered across the heap. Skyris uses an <a href="https://github.com/skypjack/entt" target="_blank" rel="noopener">EnTT</a> entity-component-system instead. An entity is just an integer id; a component is a plain struct of data with no logic; a system iterates over entities that carry a given set of components.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 280" role="img" aria-label="Memory layout comparison: scattered OOP objects versus contiguous ECS component arrays.">
+            <!-- OOP -->
+            <text x="40" y="34" font-size="13" class="t" font-weight="600">OOP: objects scattered on the heap</text>
+            <g>
+              <rect x="40"  y="50" width="70" height="40" rx="5" class="d-box"/>
+              <rect x="220" y="90" width="70" height="40" rx="5" class="d-box"/>
+              <rect x="120" y="60" width="70" height="40" rx="5" class="d-box"/>
+              <rect x="360" y="52" width="70" height="40" rx="5" class="d-box"/>
+              <rect x="500" y="96" width="70" height="40" rx="5" class="d-box"/>
+              <rect x="610" y="58" width="70" height="40" rx="5" class="d-box"/>
+            </g>
+            <g class="s-red-line" stroke-width="1.5" stroke-dasharray="3 3">
+              <path d="M110,70 L120,80" fill="none"/>
+              <path d="M190,80 L220,105" fill="none"/>
+              <path d="M290,110 L360,72" fill="none"/>
+              <path d="M430,72 L500,110" fill="none"/>
+              <path d="M570,110 L610,78" fill="none"/>
+            </g>
+            <text x="360" y="158" text-anchor="middle" font-size="11" class="s-red">pointer chasing &#183; cache miss on every hop</text>
+
+            <!-- ECS -->
+            <text x="40" y="196" font-size="13" class="t" font-weight="600">ECS: one component type, contiguous</text>
+            <g>
+              <rect x="40" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="130" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="220" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="310" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="400" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="490" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+              <rect x="580" y="212" width="90" height="40" rx="5" class="d-accent-box"/>
+            </g>
+            <path d="M50,268 L670,268" class="d-accent-line" marker-end="url(#ar-ecs)" fill="none"/>
+            <defs>
+              <marker id="ar-ecs" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/></marker>
+            </defs>
+            <text x="360" y="264" text-anchor="middle" font-size="11" class="t-accent">linear scan &#183; cache friendly</text>
+          </svg>
+        </div>
+        <figcaption>The decisive advantage of ECS is memory layout. A system processing thousands of transform components reads them linearly from a contiguous array, using the CPU cache fully, instead of chasing pointers across the heap.</figcaption>
+      </figure>
+
+      <p>In practice this looks like a view over the registry. Adding new behaviour never touches existing systems, it just adds a component and a view:</p>
+
+      <pre><code>auto view = registry.view&lt;TransformComponent, MeshComponent&gt;();
+for (auto e : view) {
+    auto&amp; tc = view.get&lt;TransformComponent&gt;(e);
+    auto&amp; mc = view.get&lt;MeshComponent&gt;(e);
+    mc.Mesh-&gt;Draw(GetWorldTransform(e), mc.Material, (int)e);
+}</code></pre>
+
+      <p>This is why the flight-replay feature dropped in cleanly. The <code>FlightLogComponent</code>, the terrain, the physics body, and the collider all followed the same pattern: a new component and a new view, no surgery on the core. That open-for-extension property is the central architectural guarantee of the design.</p>
+
+      <h2>From model space to the screen</h2>
+
+      <p>Every object in the scene lives in four coordinate systems in turn, and the renderer's job is to march each vertex through them. Understanding this chain is what lets you reason about why something appears where it does.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 200" role="img" aria-label="Coordinate transform pipeline from local space to screen space.">
+            <defs>
+              <marker id="ar-mvp" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/></marker>
+            </defs>
+            <g font-size="11.5">
+              <rect x="20"  y="70" width="96" height="54" rx="7" class="d-box"/>
+              <text x="68" y="93"  text-anchor="middle" class="t" font-weight="600">Local</text>
+              <text x="68" y="110" text-anchor="middle" class="t-muted" font-size="10">object origin</text>
+
+              <rect x="170" y="70" width="96" height="54" rx="7" class="d-box"/>
+              <text x="218" y="93"  text-anchor="middle" class="t" font-weight="600">World</text>
+              <text x="218" y="110" text-anchor="middle" class="t-muted" font-size="10">scene origin</text>
+
+              <rect x="320" y="70" width="96" height="54" rx="7" class="d-box"/>
+              <text x="368" y="93"  text-anchor="middle" class="t" font-weight="600">View</text>
+              <text x="368" y="110" text-anchor="middle" class="t-muted" font-size="10">camera space</text>
+
+              <rect x="470" y="70" width="96" height="54" rx="7" class="d-box"/>
+              <text x="518" y="93"  text-anchor="middle" class="t" font-weight="600">Clip</text>
+              <text x="518" y="110" text-anchor="middle" class="t-muted" font-size="10">[-1, 1]</text>
+
+              <rect x="614" y="70" width="86" height="54" rx="7" class="d-accent-box"/>
+              <text x="657" y="93"  text-anchor="middle" class="t-accent" font-weight="600">Screen</text>
+              <text x="657" y="110" text-anchor="middle" class="t-soft" font-size="10">pixels</text>
+            </g>
+            <g class="d-accent-line" fill="none">
+              <line x1="116" y1="97" x2="166" y2="97" marker-end="url(#ar-mvp)"/>
+              <line x1="266" y1="97" x2="316" y2="97" marker-end="url(#ar-mvp)"/>
+              <line x1="416" y1="97" x2="466" y2="97" marker-end="url(#ar-mvp)"/>
+              <line x1="566" y1="97" x2="610" y2="97" marker-end="url(#ar-mvp)"/>
+            </g>
+            <g font-size="11" class="t-accent" text-anchor="middle" font-family="var(--mono)">
+              <text x="141" y="60">M</text>
+              <text x="291" y="60">V</text>
+              <text x="441" y="60">P</text>
+              <text x="588" y="60">viewport</text>
+            </g>
+            <text x="360" y="165" text-anchor="middle" font-size="12" class="t-soft">clip = P &#183; V &#183; M &#183; local     with     M = T(t) &#183; R(q) &#183; S(s)</text>
+          </svg>
+        </div>
+        <figcaption>The model matrix M applies scale, then rotation, then translation, in that order. The view matrix V expresses the world from the camera's vantage, and the projection matrix P applies perspective. Their product, computed once per frame, is uploaded to a uniform buffer shared by every shader.</figcaption>
+      </figure>
+
+      <p>Attitude is stored as a quaternion throughout, never Euler angles, to sidestep gimbal lock. Skyris is right-handed to match OpenGL and GLM, so no sign flips leak into the math. The lighting model is Cook-Torrance physically based rendering with image-based lighting, and the framebuffer resolves 4x MSAA, because a flight path drawn against terrain shows aliasing immediately without it.</p>
+
+      <h2>Rendering 111 by 56 kilometres of terrain</h2>
+
+      <p>The terrain is the real geography the flight took place over: elevation from NASA SRTM, infrastructure from OpenStreetMap, covering roughly 111 by 56 km centred on Dekeleia Air Base. Rendered naively at full resolution that is tens of millions of vertices, impossible at interactive frame rates. A quadtree solves it by making geometric detail proportional to visual importance: nearby tiles get many polygons, distant ones get almost none.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 300" role="img" aria-label="Quadtree terrain subdivision, finer near the camera and coarser far away.">
+            <!-- big region -->
+            <rect x="40" y="30" width="360" height="240" class="d-box"/>
+            <!-- coarse far quadrants (top) -->
+            <line x1="220" y1="30" x2="220" y2="270" class="d-line"/>
+            <line x1="40" y1="150" x2="400" y2="150" class="d-line"/>
+            <!-- subdivide bottom-left toward camera -->
+            <line x1="130" y1="150" x2="130" y2="270" class="d-line"/>
+            <line x1="40" y1="210" x2="220" y2="210" class="d-line"/>
+            <!-- finer still in the nearest quad -->
+            <line x1="85" y1="210" x2="85" y2="270" class="d-line"/>
+            <line x1="40" y1="240" x2="130" y2="240" class="d-line"/>
+            <rect x="40" y="240" width="45" height="30" class="d-accent-soft"/>
+            <rect x="40" y="240" width="45" height="30" class="d-accent-stroke"/>
+
+            <!-- camera -->
+            <circle cx="62" cy="256" r="7" class="d-accent-fill"/>
+            <path d="M62,256 L150,140 M62,256 L150,200" class="d-accent-line d-dash" fill="none"/>
+            <text x="62" y="288" text-anchor="middle" font-size="11" class="t-accent">camera</text>
+            <text x="330" y="55" text-anchor="middle" font-size="11" class="t-muted">coarse LOD (far)</text>
+
+            <!-- tree -->
+            <g class="d-line">
+              <line x1="560" y1="45"  x2="500" y2="95"/>
+              <line x1="560" y1="45"  x2="620" y2="95"/>
+              <line x1="500" y1="95"  x2="465" y2="150"/>
+              <line x1="500" y1="95"  x2="535" y2="150"/>
+              <line x1="465" y1="150" x2="440" y2="205"/>
+              <line x1="465" y1="150" x2="490" y2="205"/>
+            </g>
+            <g>
+              <circle cx="560" cy="45"  r="11" class="d-box"/>
+              <circle cx="500" cy="95"  r="11" class="d-box"/>
+              <circle cx="620" cy="95"  r="11" class="d-box"/>
+              <circle cx="535" cy="150" r="11" class="d-box"/>
+              <circle cx="465" cy="150" r="11" class="d-box"/>
+              <circle cx="440" cy="205" r="11" class="d-accent-box"/>
+              <circle cx="490" cy="205" r="11" class="d-accent-box"/>
+            </g>
+            <text x="560" y="238" text-anchor="middle" font-size="11" class="t-muted">nodes split by camera distance;</text>
+            <text x="560" y="254" text-anchor="middle" font-size="11" class="t-muted">leaves hold the actual chunk mesh</text>
+          </svg>
+        </div>
+        <figcaption>Each quadtree node stores an axis-aligned bounding box with a true height range pulled from an elevation mipmap, so mountainous chunks are not wrongly culled. Traversal tests each node against the six frustum planes and skips whole subtrees at once. In practice the visible set stabilises around 50 to 150 chunks regardless of altitude.</figcaption>
+      </figure>
+
+      <p>Two details make this robust. First, the bounding box of every node carries a real minimum and maximum height, extracted in constant time from a precomputed elevation mipmap, so tall terrain is not clipped away by a flat guess. Second, frustum culling uses the positive-vertex test against six planes extracted directly from the view-projection matrix, which rejects an entire chunk with six dot products. Buildings, roads, and runways come from OpenStreetMap, triangulated with earcut and extruded, and vegetation is drawn with GPU instancing: one draw call per tree variant renders tens of thousands of trees.</p>
+
+
+      <figure class="figure">
+        <div class="figure-frame" style="padding:0;overflow:hidden;border-radius:8px;">
+          <img src="assets/terrain.png" alt="Terrain partitioned into quadtree leaves" style="display:block;width:100%;height:auto;">
+        </div>
+        <figcaption>Terrain partitioned into quadtree leaves, finer near the camera.</figcaption>
+      </figure>
+
+      <h2>Replaying the flight</h2>
+
+      <p>The replay system is what justifies the whole engine. The problem it solves is a timing mismatch: the recorder samples at 50 to 200 Hz depending on load, while the render loop runs near 60 Hz, so on any given frame the playback clock falls between two recorded samples. Finding the bracketing pair is a binary search over timestamps; smoothing between them needs interpolation.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 250" role="img" aria-label="Flight replay: binary search for the bracketing frames, then LERP for position and SLERP for attitude.">
+            <!-- irregular frame ticks -->
+            <line x1="40" y1="70" x2="680" y2="70" class="d-line"/>
+            <g class="d-accent-fill">
+              <circle cx="70" cy="70" r="4"/><circle cx="130" cy="70" r="4"/><circle cx="175" cy="70" r="4"/>
+              <circle cx="250" cy="70" r="4"/><circle cx="300" cy="70" r="4"/><circle cx="395" cy="70" r="4"/>
+              <circle cx="470" cy="70" r="4"/><circle cx="560" cy="70" r="4"/><circle cx="650" cy="70" r="4"/>
+            </g>
+            <text x="40" y="52" font-size="11" class="t-muted">CSV frames (irregular timestamps)</text>
+
+            <!-- playback cursor between two -->
+            <line x1="340" y1="40" x2="340" y2="100" class="s-red-line" stroke-width="1.5"/>
+            <text x="340" y="34" text-anchor="middle" font-size="11" class="s-red">playback clock t</text>
+            <path d="M300,86 L340,86 M340,86 L395,86" class="d-accent-line" fill="none"/>
+            <text x="347" y="103" text-anchor="middle" font-size="10.5" class="t-accent">bracket a, b</text>
+
+            <!-- outputs -->
+            <g font-size="12">
+              <rect x="90" y="150" width="230" height="60" rx="8" class="d-box"/>
+              <text x="205" y="176" text-anchor="middle" class="t" font-weight="600">LERP</text>
+              <text x="205" y="194" text-anchor="middle" class="t-muted" font-size="10.5">position, velocity, altitude, GPS</text>
+
+              <rect x="400" y="150" width="230" height="60" rx="8" class="d-accent-box"/>
+              <text x="515" y="176" text-anchor="middle" class="t-accent" font-weight="600">SLERP</text>
+              <text x="515" y="194" text-anchor="middle" class="t-soft" font-size="10.5">attitude (quaternion), shortest arc</text>
+            </g>
+            <path d="M300,90 L205,148" class="d-line" fill="none" marker-end="url(#ar-rep)"/>
+            <path d="M380,90 L515,148" class="d-line" fill="none" marker-end="url(#ar-rep)"/>
+            <defs><marker id="ar-rep" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" class="marker-line"/></marker></defs>
+            <text x="360" y="238" text-anchor="middle" font-size="11" class="t-muted">interpolated frame &#8594; drives the aircraft transform &#183; also feeds the ML pipeline, same thread, under 0.5 ms</text>
+          </svg>
+        </div>
+        <figcaption>Physical quantities like position and velocity interpolate linearly. Attitude cannot: Euler angles wrap at 180 degrees, so a naive blend would spin the aircraft the long way around. Converting to quaternions and using spherical linear interpolation guarantees the shortest rotation arc and constant angular velocity.</figcaption>
+      </figure>
+
+      <p>The interpolated frame does three things on the same thread, in sequence, because the combined cost is under half a millisecond: it drives the aircraft transform, it feeds the anomaly-detection pipeline, and it updates a procedural spring-damper "bob" whose amplitude is driven by the recorded gyro rate, so the aircraft visibly shivers more in turbulence. The aircraft position is imposed rather than simulated: physics only handles collision, while the recorded IMU and GPS data dictate exactly where the aircraft is.</p>
+
+      <h2>Where the frame budget goes</h2>
+
+      <p>At 60 Hz there are about 16.7 ms to spend. Measured on the M1 with full terrain, OpenStreetMap geometry, instanced vegetation, and active replay with ML scoring, it breaks down cleanly.</p>
+
+      <table class="spec-table">
+        <thead><tr><th>Subsystem</th><th>Time / frame</th><th>Share</th></tr></thead>
+        <tbody>
+          <tr><td>Rendering (terrain, OSM, PBR)</td><td>11.8 ms</td><td>70.8%</td></tr>
+          <tr><td>Physics update (Jolt)</td><td>1.9 ms</td><td>11.4%</td></tr>
+          <tr><td>ImGui / ImPlot UI</td><td>1.1 ms</td><td>6.6%</td></tr>
+          <tr><td>Flight replay + interpolation</td><td>0.3 ms</td><td>1.8%</td></tr>
+          <tr><td>ML scoring (100 trees)</td><td>0.09 ms</td><td>0.5%</td></tr>
+          <tr><td>Swap + miscellaneous</td><td>1.5 ms</td><td>8.9%</td></tr>
+        </tbody>
+      </table>
+
+      <p>Rendering dominates, as expected for this much terrain, and everything that makes Skyris a debriefing tool rather than a viewer, the replay and the ML, together costs under 2.5% of the budget. Physics runs on a fixed 1/60 s timestep with Jolt, because a variable step feeds the semi-implicit Euler integrator inconsistent time deltas and produces unstable results.</p>
+
+      <h2>The choices I would defend, and the ones I would revisit</h2>
+
+      <p>The two decisions that paid off most were building a custom engine and choosing ECS over inheritance. The first let flight replay reach into every layer; the second made every later feature an additive change rather than a refactor. Blocking, synchronous events kept state management simple at the cost of a heavy handler being able to stall a frame, a fair trade for this application.</p>
+
+      <p>What I would revisit: the quadtree rebuild runs on the main thread and can stall for a few milliseconds on large scenes, which double-buffering on a background thread would eliminate. Terrain chunks are regenerated from scratch on every scene load, so caching them to disk would cut load time from around ten seconds to under one. And the whole render pipeline is single-threaded; a Vulkan backend with multi-threaded command buffer recording is the natural next step, and the platform abstraction layer was designed precisely so that swapping it in would leave the renderer, scene, and editor untouched.</p>
+
+    </div>
+
+  </article>
+
+  <footer>
+    <p><a href="index.html">&larr; More writing</a></p>
+    <p>&copy; 2026 Georgios Kiritsis &middot; <a href="mailto:georgekiritsis5@gmail.com">georgekiritsis5@gmail.com</a></p>
+  </footer>
+
+</div>
+
+<script>
+  const toggle = document.getElementById('theme-toggle');
+  toggle.addEventListener('click', function() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Writing &middot; Georgios Kiritsis</title>
+<meta name="description" content="Long-form notes on the things I build and think about, across systems, machine learning, robotics, embedded hardware, and graphics. Each one stands on its own and goes deeper than a paper abstract allows.">
+<meta name="author" content="Georgios Kiritsis">
+
+<meta property="og:title" content="Writing &middot; Georgios Kiritsis">
+<meta property="og:description" content="Technical deep-dives on flight-data systems, embedded engineering, and aerospace machine learning.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://georgekiritsis.com/writing/">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Crimson+Pro:ital,wght@0,400;0,600;1,400&amp;display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="../style.css">
+
+<script>
+  (function() {
+    const stored = localStorage.getItem('theme');
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const theme = stored || (systemDark ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
+</head>
+<body>
+
+<button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+  <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+  </svg>
+  <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+  </svg>
+</button>
+
+<div class="container article-container">
+
+  <a class="back-link" href="../index.html">&larr; Home</a>
+
+  <div class="article-header">
+    <h1 class="article-title">Writing</h1>
+    <p class="article-meta">Technical deep-dives on the systems behind my projects</p>
+  </div>
+
+  <p class="blog-intro"> Long-form notes on the things I build and think about, across systems, machine learning, robotics, embedded hardware, and graphics. Each one stands on its own and goes deeper than a paper abstract allows.</p>
+
+  <div class="blog-list">
+
+    <a class="blog-card" href="phase-aware-anomaly-detection.html">
+      <h2 class="blog-card-title">Phase-Aware Anomaly Detection on Flight Time Series</h2>
+      <p class="blog-card-meta">2026 &middot; ~12 min read</p>
+      <p class="blog-card-desc">Flight telemetry is non-stationary: a 30-degree bank is routine in a turn and alarming in cruise. This is how a phase-conditional Isolation Forest separates normal maneuver dynamics from genuine anomalies across five flight phases, and scores each one in under 0.1 ms per frame.</p>
+      <div class="blog-card-footer">
+        <span class="blog-card-tags">
+          <span class="tag">Machine Learning</span>
+          <span class="tag">Time Series</span>
+          <span class="tag">Isolation Forest</span>
+        </span>
+        <span class="blog-card-more">Read &rarr;</span>
+      </div>
+    </a>
+
+    <a class="blog-card" href="skyris-engine.html">
+      <h2 class="blog-card-title">Architecture of Skyris: a Real-Time Flight Replay Engine</h2>
+      <p class="blog-card-meta">2026 &middot; ~14 min read</p>
+      <p class="blog-card-desc">A custom C++20/OpenGL engine that reconstructs a training flight over its real terrain. The design choices that made it work: an EnTT entity-component-system, a platform abstraction layer, physically based rendering, quadtree LOD terrain from SRTM elevation, and deterministic replay with quaternion interpolation.</p>
+      <div class="blog-card-footer">
+        <span class="blog-card-tags">
+          <span class="tag">C++20</span>
+          <span class="tag">OpenGL</span>
+          <span class="tag">ECS</span>
+          <span class="tag">Systems</span>
+        </span>
+        <span class="blog-card-more">Read &rarr;</span>
+      </div>
+    </a>
+
+    <a class="blog-card" href="ikaros-flight-computer.html">
+      <h2 class="blog-card-title">Designing Ikaros: a Cockpit-Class Flight Data Recorder</h2>
+      <p class="blog-card-meta">2026 &middot; ~13 min read</p>
+      <p class="blog-card-desc">Building a black box for an aircraft that never had one. A custom STM32F405 board, three sensors on two SPI buses, Mahony AHRS attitude estimation at 400 Hz on a 168 MHz core, and a CSV logging format designed to be the exact interface contract the replay engine consumes.</p>
+      <div class="blog-card-footer">
+        <span class="blog-card-tags">
+          <span class="tag">STM32</span>
+          <span class="tag">Embedded C</span>
+          <span class="tag">Sensor Fusion</span>
+          <span class="tag">PCB</span>
+        </span>
+        <span class="blog-card-more">Read &rarr;</span>
+      </div>
+    </a>
+
+  </div>
+
+  <footer>
+    <p><a href="../index.html">&larr; Back to home</a></p>
+    <p>&copy; 2026 Georgios Kiritsis &middot; <a href="mailto:georgekiritsis5@gmail.com">georgekiritsis5@gmail.com</a></p>
+  </footer>
+
+</div>
+
+<script>
+  const toggle = document.getElementById('theme-toggle');
+  toggle.addEventListener('click', function() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  });
+</script>
+
+</body>
+</html>

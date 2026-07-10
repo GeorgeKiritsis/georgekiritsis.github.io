@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Designing Ikaros: a Cockpit-Class Flight Data Recorder &middot; Georgios Kiritsis</title>
+<meta name="description" content="Building a black box for an aircraft that never had one: a custom STM32F405 board, three sensors on two SPI buses, Mahony AHRS at 400 Hz, and a CSV format that is the interface contract for the replay engine.">
+<meta name="author" content="Georgios Kiritsis">
+
+<meta property="og:title" content="Designing Ikaros: a Cockpit-Class Flight Data Recorder">
+<meta property="og:description" content="Custom STM32F405 hardware, sensor fusion with Mahony AHRS, and a logging format designed as an interface contract.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://georgekiritsis.com/writing/ikaros-flight-computer.html">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Crimson+Pro:ital,wght@0,400;0,600;1,400&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="../style.css">
+
+<script>
+  (function() {
+    const stored = localStorage.getItem('theme');
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const theme = stored || (systemDark ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
+</head>
+<body>
+
+<button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+  <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+  </svg>
+  <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+  </svg>
+</button>
+
+<div class="container article-container">
+
+  <a class="back-link" href="index.html">&larr; Writing</a>
+
+  <article class="article">
+
+    <header class="article-header">
+      <h1 class="article-title">Designing Ikaros: a Cockpit-Class Flight Data Recorder</h1>
+      <p class="article-meta">2026 &middot; ~13 min read</p>
+    </header>
+
+    <div class="article-body">
+
+      <p>The Tecnam P2002-JF is the primary trainer at the Hellenic Air Force Academy, and like most light training aircraft it carries no flight-data recorder. There is no black box, no way to reconstruct what a cadet actually did on a sortie beyond the instructor's memory and a paper debrief. Ikaros is my answer to that gap: a self-contained recorder that captures attitude, position, and dynamics at high rate onto a microSD card, then hands that data to the <a href="skyris-engine.html">Skyris</a> replay engine for analysis.</p>
+
+      <p>The constraints were real. It had to be small and light enough to sit in a trainer cockpit, run on cockpit power without a host computer, survive vibration, and produce data faithful enough that a replay would match what the pilot flew. This note is about the engineering underneath that: the board, the sensor timing, the attitude estimation, and the deliberately boring file format that ties it to the rest of the system.</p>
+
+
+      <figure class="figure">
+        <div class="figure-frame" style="padding:0;overflow:hidden;border-radius:8px;">
+          <img src="assets/top.jpg" alt="Ikaros PCB, front" style="display:block;width:100%;height:auto;">
+        </div>
+        <figcaption>The Ikaros board: STM32F405 core, sensor cluster, microSD, and GPS header.</figcaption>
+      </figure>
+
+      <h2>The board</h2>
+
+      <p>At the centre is an STM32F405RGT6, an ARM Cortex-M4 running at 168 MHz with a hardware floating-point unit, 1 MB of flash, and 192 KB of SRAM. The FPU is not a luxury here; the attitude filter runs hundreds of times a second and is dense with floating-point work, and doing that in software emulation would blow the timing budget. Around it sit three sensors and two peripherals, each chosen for a specific job.</p>
+
+      <table class="spec-table">
+        <thead><tr><th>Part</th><th>Role</th><th>Interface</th></tr></thead>
+        <tbody>
+          <tr><td>BMI088</td><td>IMU: accelerometer + gyroscope</td><td>SPI</td></tr>
+          <tr><td>LIS2MDL</td><td>3-axis magnetometer (heading)</td><td>SPI</td></tr>
+          <tr><td>BMP280</td><td>Barometric pressure (altitude)</td><td>SPI</td></tr>
+          <tr><td>NEO-6M</td><td>GPS position and ground speed</td><td>UART, 9600 baud</td></tr>
+          <tr><td>microSD</td><td>Persistent CSV logging</td><td>SDIO, 4-bit</td></tr>
+        </tbody>
+      </table>
+
+      <p>The BMI088 in particular is an aviation-minded choice: it is designed for high-vibration environments, with the accelerometer and gyroscope on separate dies to reject cross-axis vibration coupling, which is exactly the failure mode a piston trainer produces. The whole system is bare-metal C on the STM32 HAL, with no operating system. A cooperative scheduler over hardware timers was the deliberate alternative to an RTOS: the timing requirements are fixed and known, so a preemptive kernel would add complexity and jitter without buying anything.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 320" role="img" aria-label="System block diagram: STM32F405 connected to three sensors, GPS, and microSD.">
+            <!-- MCU -->
+            <rect x="285" y="120" width="150" height="90" rx="10" class="d-accent-box"/>
+            <text x="360" y="152" text-anchor="middle" class="t-accent" font-weight="600" font-size="13">STM32F405</text>
+            <text x="360" y="170" text-anchor="middle" class="t-soft" font-size="10.5">Cortex-M4 @ 168 MHz</text>
+            <text x="360" y="186" text-anchor="middle" class="t-soft" font-size="10.5">FPU &#183; 192 KB SRAM</text>
+            <text x="360" y="202" text-anchor="middle" class="t-soft" font-size="10.5">bare-metal C</text>
+
+            <!-- sensors top -->
+            <g font-size="11.5">
+              <rect x="80"  y="30" width="130" height="52" rx="8" class="d-box"/>
+              <text x="145" y="52" text-anchor="middle" class="t" font-weight="600">BMI088</text>
+              <text x="145" y="68" text-anchor="middle" class="t-muted" font-size="10">accel + gyro</text>
+
+              <rect x="295" y="30" width="130" height="52" rx="8" class="d-box"/>
+              <text x="360" y="52" text-anchor="middle" class="t" font-weight="600">LIS2MDL</text>
+              <text x="360" y="68" text-anchor="middle" class="t-muted" font-size="10">magnetometer</text>
+
+              <rect x="510" y="30" width="130" height="52" rx="8" class="d-box"/>
+              <text x="575" y="52" text-anchor="middle" class="t" font-weight="600">BMP280</text>
+              <text x="575" y="68" text-anchor="middle" class="t-muted" font-size="10">barometer</text>
+            </g>
+
+            <!-- peripherals bottom -->
+            <g font-size="11.5">
+              <rect x="120" y="248" width="150" height="52" rx="8" class="d-box"/>
+              <text x="195" y="270" text-anchor="middle" class="t" font-weight="600">NEO-6M GPS</text>
+              <text x="195" y="286" text-anchor="middle" class="t-muted" font-size="10">UART, 9600 baud</text>
+
+              <rect x="450" y="248" width="150" height="52" rx="8" class="d-box"/>
+              <text x="525" y="270" text-anchor="middle" class="t" font-weight="600">microSD</text>
+              <text x="525" y="286" text-anchor="middle" class="t-muted" font-size="10">SDIO 4-bit</text>
+            </g>
+
+            <!-- links with bus labels -->
+            <g class="d-line" fill="none">
+              <path d="M145,82 L145,110 L300,120"/>
+              <path d="M360,82 L360,120"/>
+              <path d="M575,82 L575,110 L420,120"/>
+              <path d="M300,205 L195,230 L195,248"/>
+              <path d="M420,205 L525,230 L525,248"/>
+            </g>
+            <g font-size="10" class="t-accent" font-family="var(--mono)">
+              <text x="205" y="104">SPI</text>
+              <text x="368" y="104">SPI</text>
+              <text x="505" y="104">SPI</text>
+              <text x="215" y="228">UART</text>
+              <text x="470" y="228">SDIO</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>The three sensors sit on SPI, chosen over I2C for its higher sustained throughput and immunity to the bus-lockup failures that plague I2C under electrical noise. GPS arrives asynchronously over UART; the microSD card is driven over a 4-bit SDIO bus for logging bandwidth.</figcaption>
+      </figure>
+
+      <h2>Sampling: different sensors, different rates</h2>
+
+      <p>The sensors do not all deserve the same attention. The gyroscope and accelerometer change fast and drive the attitude filter, so they are read at 400 Hz. The magnetometer only corrects slow heading drift, so 50 Hz is plenty. The barometer is slower still. Everything is orchestrated by a 1 ms timer tick that acts as the system heartbeat, with each task claiming its slot by a simple counter.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 250" role="img" aria-label="Cooperative sampling schedule driven by a 1 ms timer tick.">
+            <!-- lanes -->
+            <g font-size="11.5">
+              <text x="30" y="46"  class="t" font-weight="600">IMU</text>
+              <text x="30" y="62"  class="t-muted" font-size="10">400 Hz</text>
+              <text x="30" y="98"  class="t" font-weight="600">Mag</text>
+              <text x="30" y="114" class="t-muted" font-size="10">50 Hz</text>
+              <text x="30" y="150" class="t" font-weight="600">Baro</text>
+              <text x="30" y="166" class="t-muted" font-size="10">25 Hz</text>
+              <text x="30" y="202" class="t" font-weight="600">Log</text>
+              <text x="30" y="218" class="t-muted" font-size="10">100 Hz</text>
+            </g>
+
+            <!-- baseline lanes -->
+            <g class="d-grid">
+              <line x1="90" y1="52" x2="690" y2="52"/>
+              <line x1="90" y1="104" x2="690" y2="104"/>
+              <line x1="90" y1="156" x2="690" y2="156"/>
+              <line x1="90" y1="208" x2="690" y2="208"/>
+            </g>
+
+            <!-- IMU ticks: every 2.5 ms -> dense -->
+            <g class="d-accent-fill">
+              <rect x="98" y="44" width="5" height="16" rx="1"/><rect x="128" y="44" width="5" height="16" rx="1"/>
+              <rect x="158" y="44" width="5" height="16" rx="1"/><rect x="188" y="44" width="5" height="16" rx="1"/>
+              <rect x="218" y="44" width="5" height="16" rx="1"/><rect x="248" y="44" width="5" height="16" rx="1"/>
+              <rect x="278" y="44" width="5" height="16" rx="1"/><rect x="308" y="44" width="5" height="16" rx="1"/>
+              <rect x="338" y="44" width="5" height="16" rx="1"/><rect x="368" y="44" width="5" height="16" rx="1"/>
+              <rect x="398" y="44" width="5" height="16" rx="1"/><rect x="428" y="44" width="5" height="16" rx="1"/>
+              <rect x="458" y="44" width="5" height="16" rx="1"/><rect x="488" y="44" width="5" height="16" rx="1"/>
+              <rect x="518" y="44" width="5" height="16" rx="1"/><rect x="548" y="44" width="5" height="16" rx="1"/>
+              <rect x="578" y="44" width="5" height="16" rx="1"/><rect x="608" y="44" width="5" height="16" rx="1"/>
+              <rect x="638" y="44" width="5" height="16" rx="1"/><rect x="668" y="44" width="5" height="16" rx="1"/>
+            </g>
+            <!-- Mag ticks: sparse -->
+            <g class="d-accent-fill">
+              <rect x="98" y="96" width="5" height="16" rx="1"/><rect x="248" y="96" width="5" height="16" rx="1"/>
+              <rect x="398" y="96" width="5" height="16" rx="1"/><rect x="548" y="96" width="5" height="16" rx="1"/>
+            </g>
+            <!-- Baro ticks: sparser -->
+            <g class="d-accent-fill">
+              <rect x="98" y="148" width="5" height="16" rx="1"/><rect x="338" y="148" width="5" height="16" rx="1"/>
+              <rect x="578" y="148" width="5" height="16" rx="1"/>
+            </g>
+            <!-- Log ticks -->
+            <g class="s-amber">
+              <rect x="98" y="200" width="5" height="16" rx="1"/><rect x="218" y="200" width="5" height="16" rx="1"/>
+              <rect x="338" y="200" width="5" height="16" rx="1"/><rect x="458" y="200" width="5" height="16" rx="1"/>
+              <rect x="578" y="200" width="5" height="16" rx="1"/>
+            </g>
+
+            <text x="390" y="240" text-anchor="middle" font-size="11" class="t-muted">shared 1 ms timer tick &#183; each task fires on its own counter &#183; no RTOS, no preemption</text>
+          </svg>
+        </div>
+        <figcaption>A cooperative schedule off a single 1 ms tick. Reading the gyroscope 8 times more often than the magnetometer is not wasteful; it matches each signal's information rate, and it keeps the fast attitude loop fed while the SD write, which can stall for milliseconds, never blocks a sensor read.</figcaption>
+      </figure>
+
+      <p>Each sensor also gets its raw output conditioned. The BMI088 registers arrive as two bytes that must be reassembled and sign-extended before scaling to physical units, and every channel passes through a lightweight per-channel Kalman filter to suppress the high-frequency noise a piston engine injects into everything bolted to the airframe:</p>
+
+      <pre><code>// reassemble a signed 16-bit sample from two SPI bytes, then scale
+int16_t raw = (int16_t)((hi &lt;&lt; 8) | lo);
+float   acc = (float)raw * ACC_RANGE / 32768.0f;   // e.g. +/- 6 g</code></pre>
+
+      <h2>Attitude estimation with Mahony AHRS</h2>
+
+      <p>No single sensor knows which way the aircraft is pointing. The gyroscope measures angular rate, which integrates into orientation but drifts without bound. The accelerometer senses gravity, giving an absolute pitch and roll reference, but is corrupted by every maneuver. The magnetometer senses magnetic north for heading, but is noisy and disturbed by nearby metal and current. Sensor fusion is the art of combining them so each covers the others' weaknesses, and Ikaros uses a Mahony AHRS filter for it.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 300" role="img" aria-label="Mahony AHRS complementary filter: gyro integration corrected by accel and mag reference error through a PI feedback loop.">
+            <defs>
+              <marker id="ar-ahrs" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/></marker>
+            </defs>
+            <g font-size="11.5">
+              <!-- inputs -->
+              <rect x="24" y="30"  width="120" height="42" rx="7" class="d-box"/>
+              <text x="84" y="56" text-anchor="middle" class="t" font-weight="600">Gyroscope</text>
+              <rect x="24" y="130" width="120" height="42" rx="7" class="d-box"/>
+              <text x="84" y="156" text-anchor="middle" class="t" font-weight="600">Accelerometer</text>
+              <rect x="24" y="200" width="120" height="42" rx="7" class="d-box"/>
+              <text x="84" y="226" text-anchor="middle" class="t" font-weight="600">Magnetometer</text>
+
+              <!-- error estimator -->
+              <rect x="210" y="150" width="150" height="72" rx="8" class="d-box"/>
+              <text x="285" y="180" text-anchor="middle" class="t" font-weight="600">Reference error</text>
+              <text x="285" y="198" text-anchor="middle" class="t-muted" font-size="10">measured vs</text>
+              <text x="285" y="212" text-anchor="middle" class="t-muted" font-size="10">predicted gravity / north</text>
+
+              <!-- PI -->
+              <rect x="210" y="60" width="150" height="52" rx="8" class="d-accent-box"/>
+              <text x="285" y="84"  text-anchor="middle" class="t-accent" font-weight="600">PI feedback</text>
+              <text x="285" y="101" text-anchor="middle" class="t-soft" font-size="10">Kp = 2.0, Ki = 0.005</text>
+
+              <!-- integrate -->
+              <rect x="430" y="60" width="150" height="52" rx="8" class="d-box"/>
+              <text x="505" y="84"  text-anchor="middle" class="t" font-weight="600">Integrate rate</text>
+              <text x="505" y="101" text-anchor="middle" class="t-muted" font-size="10">quaternion update</text>
+
+              <!-- normalize + output -->
+              <rect x="430" y="150" width="150" height="52" rx="8" class="d-box"/>
+              <text x="505" y="174" text-anchor="middle" class="t" font-weight="600">Normalize q</text>
+              <text x="505" y="191" text-anchor="middle" class="t-muted" font-size="10">fast inverse sqrt</text>
+
+              <rect x="614" y="150" width="86" height="52" rx="8" class="d-accent-box"/>
+              <text x="657" y="174" text-anchor="middle" class="t-accent" font-weight="600">Euler</text>
+              <text x="657" y="191" text-anchor="middle" class="t-soft" font-size="10">roll/pitch/yaw</text>
+            </g>
+
+            <!-- arrows -->
+            <g class="d-accent-line" fill="none">
+              <path d="M144,51 L206,80" marker-end="url(#ar-ahrs)"/>
+              <path d="M144,150 L206,168" marker-end="url(#ar-ahrs)"/>
+              <path d="M144,215 L206,200" marker-end="url(#ar-ahrs)"/>
+              <path d="M360,180 L360,140 L426,100" marker-end="url(#ar-ahrs)"/>
+              <path d="M360,86 L426,86" marker-end="url(#ar-ahrs)"/>
+              <path d="M505,112 L505,148" marker-end="url(#ar-ahrs)"/>
+              <path d="M580,176 L610,176" marker-end="url(#ar-ahrs)"/>
+            </g>
+            <!-- feedback loop -->
+            <path d="M430,176 L390,176 L390,236 L84,236 L84,172" class="d-line d-dash" fill="none" marker-end="url(#ar-ahrs)"/>
+            <text x="240" y="252" font-size="10" class="t-muted">corrected orientation feeds back to predict the next reference</text>
+          </svg>
+        </div>
+        <figcaption>Mahony is a complementary filter. The gyroscope provides the fast, high-frequency estimate; the accelerometer and magnetometer provide slow, absolute references. Their disagreement, expressed as a cross-product error, is fed through a proportional-integral controller that gently steers the gyro integration back toward truth, with the integral term absorbing gyro bias.</figcaption>
+      </figure>
+
+      <p>Mahony was the right filter for this hardware over the more famous alternative, the Extended Kalman Filter. An EKF is more accurate in principle but carries a heavy per-step cost of matrix inversions and Jacobian evaluations. Mahony achieves comparable accuracy for this application at a fraction of the compute, which is what lets it close the loop at 400 Hz on a microcontroller. The gains were tuned empirically: <code>Kp = 2.0</code> sets how aggressively the absolute references pull the estimate, and a small <code>Ki = 0.005</code> lets the filter learn and cancel the gyroscope's slow bias without chasing noise.</p>
+
+      <p>The measured effect of the integral term is stark. With the accelerometer and magnetometer correction disabled, heading drifts about 4.8 degrees per minute of pure gyro integration. With the full filter running, yaw error stays under 0.3 degrees in straight-and-level flight and around 1.1 degrees through sustained turns, where centripetal acceleration briefly contaminates the gravity reference. That is faithful enough that the replayed attitude in Skyris matches what the pilot flew.</p>
+
+      <h2>The file format is the interface contract</h2>
+
+      <p>Ikaros writes to the microSD card as plain CSV through the FatFs library, at 100 Hz, with 21 fields per row: timestamp, raw and filtered IMU, quaternion and Euler attitude, barometric altitude, and GPS position, speed, and course. There is nothing clever about the format, and that is the point. CSV is the deliberately boring, universal contract between the recorder and every downstream consumer.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 210" role="img" aria-label="CSV as the interface contract between Ikaros hardware and the Skyris engine.">
+            <defs>
+              <marker id="ar-csv" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/></marker>
+            </defs>
+            <g font-size="12">
+              <rect x="30" y="70" width="150" height="70" rx="8" class="d-box"/>
+              <text x="105" y="98"  text-anchor="middle" class="t" font-weight="600">Ikaros</text>
+              <text x="105" y="116" text-anchor="middle" class="t-muted" font-size="10.5">100 Hz, 21 fields</text>
+
+              <rect x="285" y="70" width="150" height="70" rx="8" class="d-accent-box"/>
+              <text x="360" y="98"  text-anchor="middle" class="t-accent" font-weight="600">CSV on SD</text>
+              <text x="360" y="116" text-anchor="middle" class="t-soft" font-size="10.5">flush every 100 rows</text>
+
+              <rect x="540" y="70" width="150" height="70" rx="8" class="d-box"/>
+              <text x="615" y="98"  text-anchor="middle" class="t" font-weight="600">Skyris</text>
+              <text x="615" y="116" text-anchor="middle" class="t-muted" font-size="10.5">dynamic column map</text>
+            </g>
+            <g class="d-accent-line" fill="none">
+              <line x1="180" y1="105" x2="281" y2="105" marker-end="url(#ar-csv)"/>
+              <line x1="435" y1="105" x2="536" y2="105" marker-end="url(#ar-csv)"/>
+            </g>
+            <text x="360" y="50" text-anchor="middle" font-size="11" class="t-muted">write path (aircraft)</text>
+            <text x="360" y="175" text-anchor="middle" font-size="11" class="t-muted">a plain, versionable text contract: no shared binary struct, no endianness to agree on</text>
+          </svg>
+        </div>
+        <figcaption>Because the recorder and the engine agree only on column names, either side can evolve independently. Skyris reads the header row and builds a column map at load time, so adding a field to the recorder never breaks an old log, and an old engine never chokes on a new one.</figcaption>
+      </figure>
+
+      <p>Two engineering details keep the logging honest. Writes are buffered and flushed to the card every 100 samples rather than every row, because a raw SD write can stall unpredictably for 5 to 20 ms, and flushing on every sample would jam the fast sensor loop. Batching amortises that cost. And on the read side, Skyris does not assume a fixed column order; it parses the header and maps names to indices, which is what makes the CSV a durable contract rather than a brittle coincidence of field positions.</p>
+
+      <h2>What the whole thing adds up to</h2>
+
+      <p>Ikaros turns an aircraft with no instrumentation into one that records a complete, replayable account of every sortie, for the cost of a small custom board and a microSD card. The engineering that matters is not any single exotic part; it is the set of proportionate choices. SPI over I2C for noise immunity. A cooperative scheduler over an RTOS because the timing is known. Mahony over an EKF because it fits the silicon. Batched writes because SD cards stall. And a plain-text format because the most robust interface between two systems you control is the one with the fewest secrets.</p>
+
+      <p>Paired with the <a href="skyris-engine.html">Skyris engine</a> and the <a href="phase-aware-anomaly-detection.html">anomaly-detection pipeline</a>, it closes the loop from raw motion in the cockpit to an automated, phase-aware grade an instructor can act on. The hardware is the first link in that chain, and everything downstream is only as trustworthy as the data this board writes.</p>
+
+    </div>
+
+  </article>
+
+  <footer>
+    <p><a href="index.html">&larr; More writing</a></p>
+    <p>&copy; 2026 Georgios Kiritsis &middot; <a href="mailto:georgekiritsis5@gmail.com">georgekiritsis5@gmail.com</a></p>
+  </footer>
+
+</div>
+
+<script>
+  const toggle = document.getElementById('theme-toggle');
+  toggle.addEventListener('click', function() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  });
+</script>
+
+</body>
+</html>

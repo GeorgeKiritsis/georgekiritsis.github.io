@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase-Aware Anomaly Detection on Flight Time Series &middot; Georgios Kiritsis</title>
+<meta name="description" content="How a phase-conditional Isolation Forest separates normal maneuver dynamics from genuine anomalies across five flight phases, scoring each frame in under 0.1 ms.">
+<meta name="author" content="Georgios Kiritsis">
+
+<meta property="og:title" content="Phase-Aware Anomaly Detection on Flight Time Series">
+<meta property="og:description" content="A phase-conditional approach to unsupervised anomaly detection on non-stationary flight data.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://georgekiritsis.com/writing/phase-aware-anomaly-detection.html">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=Crimson+Pro:ital,wght@0,400;0,600;1,400&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="../style.css">
+
+<script>
+  (function() {
+    const stored = localStorage.getItem('theme');
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const theme = stored || (systemDark ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-theme', theme);
+  })();
+</script>
+</head>
+<body>
+
+<button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+  <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+  </svg>
+  <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+  </svg>
+</button>
+
+<div class="container article-container">
+
+  <a class="back-link" href="index.html">&larr; Writing</a>
+
+  <article class="article">
+
+    <header class="article-header">
+      <h1 class="article-title">Phase-Aware Anomaly Detection on Flight Time Series</h1>
+      <p class="article-meta">2026 &middot; ~12 min read</p>
+    </header>
+
+    <div class="article-body">
+
+      <p>A steep bank angle is unremarkable during a training turn and alarming during a landing flare. A 700 ft/min descent is exactly right on final approach and a red flag at cruise altitude. Flight telemetry is <em>non-stationary</em>: the statistical signature of normal behaviour shifts continuously with the phase of flight. Any anomaly detector that ignores this context does one of two useless things. It either flags every dynamic maneuver as an outlier, or it raises its tolerance so high that real deviations vanish into the noise.</p>
+
+      <p>This note describes the anomaly-detection pipeline I built into <em>Skyris</em>, the flight-debriefing engine for the 360 Training Squadron of the Hellenic Air Force Academy. The core idea is deliberately simple: do not fit one model to the whole flight. Classify each moment into a flight phase, and score it only against the distribution that phase actually implies. The whole thing runs inside the render loop at 60 Hz and costs under 0.1 ms per frame.</p>
+
+      <h2>Why a single global model fails</h2>
+
+      <p>Take a feature built from the usual suspects: airspeed, vertical speed, roll, pitch, load factor. Pool every sample from an entire flight and the resulting distribution is multi-modal by construction. Cruise contributes a dense, low-variance cluster. Takeoff, turns, and landing contribute sparse, high-variance tails. A global unsupervised model has no way to know that those tails are <em>expected</em>. It learns a single notion of "typical" that fits none of the phases.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 290" role="img" aria-label="Two overlapping distributions of bank angle for cruise and turn, and a single global threshold that cannot separate them.">
+            <line x1="55" y1="240" x2="675" y2="240" class="d-line"/>
+            <text x="365" y="272" text-anchor="middle" font-size="12" class="t-muted">bank angle magnitude  |roll|</text>
+
+            <!-- cruise distribution -->
+            <path d="M100,240 Q190,105 280,240 Z" class="d-accent-soft"/>
+            <path d="M100,240 Q190,105 280,240" class="d-accent-stroke"/>
+            <text x="190" y="150" text-anchor="middle" font-size="12" class="t-accent" font-weight="600">Cruise</text>
+            <text x="190" y="167" text-anchor="middle" font-size="11" class="t-soft">|roll| &#8776; 2.5&#176;</text>
+
+            <!-- turn distribution -->
+            <path d="M355,240 Q490,70 625,240 Z" class="s-amber" fill-opacity="0.14"/>
+            <path d="M355,240 Q490,70 625,240" class="s-amber-line" stroke-width="1.5"/>
+            <text x="490" y="120" text-anchor="middle" font-size="12" class="s-amber" font-weight="600">Turn</text>
+            <text x="490" y="137" text-anchor="middle" font-size="11" class="t-soft">|roll| &#8776; 20&#8211;30&#176;</text>
+
+            <!-- global threshold -->
+            <line x1="415" y1="55" x2="415" y2="248" class="s-red-line d-dash" stroke-width="1.5"/>
+            <text x="415" y="46" text-anchor="middle" font-size="11" class="s-red" font-weight="600">global threshold</text>
+
+            <!-- false alarm region under turn curve right of threshold -->
+            <path d="M415,240 Q525,150 625,240 Z" class="s-red" fill-opacity="0.18"/>
+            <text x="545" y="212" text-anchor="middle" font-size="10.5" class="s-red">normal turns,</text>
+            <text x="545" y="226" text-anchor="middle" font-size="10.5" class="s-red">flagged as anomalies</text>
+          </svg>
+        </div>
+        <figcaption>A single global threshold cannot satisfy both phases. Set it low enough to catch a subtle cruise anomaly and it floods every turn with false alarms; set it high enough to leave turns alone and cruise deviations disappear.</figcaption>
+      </figure>
+
+      <p>The failure mode is monotonous: the model assigns its highest anomaly scores to exactly the segments where the aircraft is doing the most, which is precisely where an instructor is paying the most attention and least needs a false alarm. The signal drowns.</p>
+
+      <h2>Segmenting the flight into phases</h2>
+
+      <p>Before any model runs, each sample is assigned a flight phase. Rather than a learned classifier, I use a small deterministic rule set over smoothed state variables, which keeps the segmentation explainable and reproducible across flights. Three quantities are enough: altitude above ground level, vertical speed, and roll magnitude.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 350" role="img" aria-label="Decision cascade classifying each frame into one of five flight phases.">
+            <defs>
+              <marker id="ar-seg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                <path d="M0,0 L8,4.5 L0,9 Z" class="marker-line"/>
+              </marker>
+              <marker id="ar-seg-a" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                <path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/>
+              </marker>
+            </defs>
+
+            <!-- conditions column -->
+            <g font-size="12.5">
+              <rect x="30" y="20"  width="250" height="46" rx="6" class="d-box"/>
+              <text x="45" y="42"  class="t" font-weight="600">AGL &lt; 5 m ?</text>
+              <text x="45" y="58"  class="t-muted" font-size="10.5">on the ground</text>
+
+              <rect x="30" y="86"  width="250" height="46" rx="6" class="d-box"/>
+              <text x="45" y="108" class="t" font-weight="600">|roll| &gt; 5&#176; ?</text>
+              <text x="45" y="124" class="t-muted" font-size="10.5">banking into a turn</text>
+
+              <rect x="30" y="152" width="250" height="46" rx="6" class="d-box"/>
+              <text x="45" y="174" class="t" font-weight="600">Vz &gt; +1 m/s ?</text>
+              <text x="45" y="190" class="t-muted" font-size="10.5">sustained climb</text>
+
+              <rect x="30" y="218" width="250" height="46" rx="6" class="d-box"/>
+              <text x="45" y="240" class="t" font-weight="600">Vz &lt; &#8722;0.5 m/s ?</text>
+              <text x="45" y="256" class="t-muted" font-size="10.5">sustained descent</text>
+
+              <rect x="30" y="284" width="250" height="46" rx="6" class="d-accent-box"/>
+              <text x="45" y="313" class="t" font-weight="600">otherwise</text>
+            </g>
+
+            <!-- phase pills -->
+            <g font-size="12.5" font-weight="600">
+              <rect x="470" y="22"  width="210" height="42" rx="21" class="d-accent-box"/>
+              <text x="575" y="48" text-anchor="middle" class="t-accent">GROUND</text>
+              <rect x="470" y="88"  width="210" height="42" rx="21" class="d-accent-box"/>
+              <text x="575" y="114" text-anchor="middle" class="t-accent">TURN</text>
+              <rect x="470" y="154" width="210" height="42" rx="21" class="d-accent-box"/>
+              <text x="575" y="180" text-anchor="middle" class="t-accent">CLIMB</text>
+              <rect x="470" y="220" width="210" height="42" rx="21" class="d-accent-box"/>
+              <text x="575" y="246" text-anchor="middle" class="t-accent">DESCEND</text>
+              <rect x="470" y="286" width="210" height="42" rx="21" class="d-accent-box"/>
+              <text x="575" y="312" text-anchor="middle" class="t-accent">CRUISE</text>
+            </g>
+
+            <!-- yes arrows -->
+            <g font-size="10.5" class="t-muted">
+              <line x1="280" y1="43"  x2="466" y2="43"  class="d-accent-line" marker-end="url(#ar-seg-a)"/>
+              <line x1="280" y1="109" x2="466" y2="109" class="d-accent-line" marker-end="url(#ar-seg-a)"/>
+              <line x1="280" y1="175" x2="466" y2="175" class="d-accent-line" marker-end="url(#ar-seg-a)"/>
+              <line x1="280" y1="241" x2="466" y2="241" class="d-accent-line" marker-end="url(#ar-seg-a)"/>
+              <line x1="280" y1="307" x2="466" y2="307" class="d-accent-line" marker-end="url(#ar-seg-a)"/>
+              <text x="300" y="37"  class="t-accent">yes</text>
+            </g>
+
+            <!-- no arrows (down) -->
+            <g>
+              <line x1="60" y1="66"  x2="60" y2="86"  class="d-line" marker-end="url(#ar-seg)"/>
+              <line x1="60" y1="132" x2="60" y2="152" class="d-line" marker-end="url(#ar-seg)"/>
+              <line x1="60" y1="198" x2="60" y2="218" class="d-line" marker-end="url(#ar-seg)"/>
+              <line x1="60" y1="264" x2="60" y2="284" class="d-line" marker-end="url(#ar-seg)"/>
+              <text x="70" y="80" font-size="10.5" class="t-muted">no</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>Phase classification is a short deterministic cascade over altitude, vertical speed, and roll. Transitions require the condition to hold for a minimum dwell time (hysteresis), so the label does not chatter at phase boundaries.</figcaption>
+      </figure>
+
+      <p>The thresholds are hysteretic. A transition requires the triggering condition to hold for a minimum dwell time rather than a single sample, so the label does not oscillate when a variable hovers near a boundary. The output is a per-sample phase label that partitions the flight into contiguous segments. On synthetic flights where the true phase is known, this cascade reaches <strong>97.3% classification accuracy</strong>, with the few errors concentrated at transition points where, for a second or two, altitude has just crossed 5 m or vertical speed is still ramping up.</p>
+
+      <h2>The feature vector</h2>
+
+      <p>Each frame is encoded as a compact 7-dimensional vector. The construction is phase-agnostic even though the models that consume it are phase-specific:</p>
+
+      <pre><code>f = [ AGL,                 # barometric altitude above ground (m)
+      GPS_speed,           # ground speed (m/s)
+      |roll|,              # bank angle magnitude (deg)
+      pitch,               # pitch angle (deg)
+      |vspeed| * 196.85,   # vertical speed (ft/min)
+      heading_rate,        # rate of course change (deg/s)
+      |a_body| / g ]       # G-load
+                           #  ->  f in R^7</code></pre>
+
+      <p>These seven capture what an instructor actually watches: where the aircraft is in the vertical, how fast, how hard it is maneuvering, and how much load it is pulling. Vertical speed is scaled to ft/min because that is the unit aviation standards for descent rate are written in, which matters later for landing scoring.</p>
+
+      <h2>One Isolation Forest per phase</h2>
+
+      <p>For each phase I train a separate <a href="https://en.wikipedia.org/wiki/Isolation_forest" target="_blank" rel="noopener">Isolation Forest</a> on the samples belonging to that phase, pooled across a reference corpus of nominal flights. Isolation Forest fits this problem for three reasons. It is unsupervised, which matters because labelled anomalies in training-flight data are scarce and expensive to produce. Its scoring is logarithmic per sample, cheap enough for a real-time loop. And it makes no distributional assumption, so it tolerates the very different feature scales across phases.</p>
+
+      <p>The intuition is geometric. An Isolation Forest builds random binary trees by repeatedly picking a random feature and a random split value. Anomalies are few and different, so they sit in sparse regions and get isolated after only a handful of splits. Normal points sit in dense clusters and take many splits to isolate. The <em>path length</em> to isolate a point is therefore the signal.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 300" role="img" aria-label="Two isolation trees. A normal point needs many splits to isolate, an anomaly needs few.">
+            <!-- left tree: normal, deep path -->
+            <g class="d-line">
+              <line x1="180" y1="40" x2="110" y2="95"/>
+              <line x1="180" y1="40" x2="250" y2="95"/>
+              <line x1="110" y1="95" x2="70"  y2="150"/>
+              <line x1="110" y1="95" x2="150" y2="150"/>
+              <line x1="150" y1="150" x2="120" y2="205"/>
+              <line x1="150" y1="150" x2="185" y2="205"/>
+              <line x1="185" y1="205" x2="160" y2="255"/>
+              <line x1="185" y1="205" x2="212" y2="255"/>
+            </g>
+            <g>
+              <circle cx="180" cy="40"  r="12" class="d-box"/>
+              <circle cx="110" cy="95"  r="12" class="d-box"/>
+              <circle cx="250" cy="95"  r="12" class="d-box"/>
+              <circle cx="70"  cy="150" r="12" class="d-box"/>
+              <circle cx="150" cy="150" r="12" class="d-box"/>
+              <circle cx="120" cy="205" r="12" class="d-box"/>
+              <circle cx="185" cy="205" r="12" class="d-box"/>
+              <circle cx="160" cy="255" r="12" class="d-accent-box"/>
+              <circle cx="212" cy="255" r="12" class="d-box"/>
+            </g>
+            <text x="180" y="285" text-anchor="middle" font-size="12" class="t-soft">normal point &#183; long path (depth 5)</text>
+
+            <!-- right tree: anomaly, short path -->
+            <g class="d-line">
+              <line x1="540" y1="40" x2="470" y2="110"/>
+              <line x1="540" y1="40" x2="610" y2="110"/>
+              <line x1="470" y1="110" x2="435" y2="175"/>
+              <line x1="470" y1="110" x2="510" y2="175"/>
+            </g>
+            <g>
+              <circle cx="540" cy="40"  r="12" class="d-box"/>
+              <circle cx="470" cy="110" r="12" class="d-box"/>
+              <circle cx="610" cy="110" r="12" class="d-box"/>
+              <circle cx="435" cy="175" r="12" class="s-red" fill-opacity="0.18" stroke="#dc2626" stroke-width="1.5"/>
+              <circle cx="510" cy="175" r="12" class="d-box"/>
+            </g>
+            <text x="540" y="285" text-anchor="middle" font-size="12" class="t-soft">anomaly &#183; short path (depth 2)</text>
+          </svg>
+        </div>
+        <figcaption>Isolation Forest scores a point by how quickly random splits isolate it. Few splits (right) means the point sits in a sparse region: an anomaly. The score aggregates path length across 100 trees.</figcaption>
+      </figure>
+
+      <p>Formally, for a point <code>x</code> the anomaly score is <code>s(x) = 2 ** ( -E[h(x)] / c(n) )</code>, where <code>E[h(x)]</code> is the mean path length across the trees and <code>c(n)</code> normalises for the expected path length in a tree built from <code>n</code> points. A score near 1 means anomalous, near 0.5 means normal. Training is a loop over phases, each model seeing only the dynamics that are normal <em>for its phase</em>:</p>
+
+      <pre><code>models = {}
+for phase, group in samples.groupby("phase"):
+    clf = IsolationForest(n_estimators=100, max_samples=256)
+    clf.fit(normalize(group[FEATURES], phase))   # per-phase z-score
+    models[phase] = clf</code></pre>
+
+      <p>So a 30-degree bank learned as ordinary by the <code>TURN</code> model never has to coexist with the tight tolerances of the <code>CRUISE</code> model. That separation is the whole point.</p>
+
+      <h2>Scoring, normalization, and the real-time pipeline</h2>
+
+      <p>Because the seven features live on wildly different scales (altitude in the thousands of metres, G-load near 1.0), each is standardised with a per-phase z-score before it reaches the forest. The mean and standard deviation for every feature, in every phase, are computed offline from a representative corpus and baked into the binary as compile-time constants:</p>
+
+      <pre><code>// per-phase normalization statistics, no runtime file I/O
+constexpr float CRUISE_MEANS[7] = { 1200, 65, 2.5, 1.0, 120, 1.5, 1.02 };
+constexpr float CRUISE_STDS [7] = {  400, 15, 3.0, 2.5,  80, 2.0, 0.08 };
+// ...GROUND, CLIMB, TURN, DESCEND likewise</code></pre>
+
+      <p>At inference, every frame walks the same short path: classify the phase, z-score the features against that phase's statistics, route them to that phase's forest, read a score, and map it to a colour. Positive scores stay green; borderline turns amber; genuine outliers red. The editor paints this straight onto the replay timeline so an instructor can jump to any flagged moment.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 250" role="img" aria-label="Per-frame inference pipeline from raw frame to colour-coded timeline.">
+            <defs>
+              <marker id="ar-pipe" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+                <path d="M0,0 L8,4.5 L0,9 Z" class="marker-accent"/>
+              </marker>
+            </defs>
+            <g font-size="12">
+              <!-- row 1 -->
+              <rect x="24"  y="30" width="140" height="56" rx="8" class="d-box"/>
+              <text x="94" y="55" text-anchor="middle" class="t" font-weight="600">Frame f</text>
+              <text x="94" y="72" text-anchor="middle" class="t-muted" font-size="10.5">17 raw signals</text>
+
+              <rect x="204" y="30" width="140" height="56" rx="8" class="d-box"/>
+              <text x="274" y="55" text-anchor="middle" class="t" font-weight="600">Classify phase</text>
+              <text x="274" y="72" text-anchor="middle" class="t-muted" font-size="10.5">O(1), 3 thresholds</text>
+
+              <rect x="384" y="30" width="140" height="56" rx="8" class="d-box"/>
+              <text x="454" y="55" text-anchor="middle" class="t" font-weight="600">Z-score</text>
+              <text x="454" y="72" text-anchor="middle" class="t-muted" font-size="10.5">per-phase &#956;, &#963;</text>
+
+              <!-- row 2 -->
+              <rect x="384" y="150" width="140" height="56" rx="8" class="d-accent-box"/>
+              <text x="454" y="175" text-anchor="middle" class="t-accent" font-weight="600">Isolation Forest</text>
+              <text x="454" y="192" text-anchor="middle" class="t-soft" font-size="10.5">phase model, O(800)</text>
+
+              <rect x="204" y="150" width="140" height="56" rx="8" class="d-box"/>
+              <text x="274" y="175" text-anchor="middle" class="t" font-weight="600">Score s</text>
+              <text x="274" y="192" text-anchor="middle" class="t-muted" font-size="10.5">normal &#8594; anomalous</text>
+
+              <rect x="24"  y="150" width="140" height="56" rx="8" class="d-box"/>
+              <text x="94" y="175" text-anchor="middle" class="t" font-weight="600">Overlay</text>
+              <text x="94" y="192" text-anchor="middle" class="t-muted" font-size="10.5">green / amber / red</text>
+            </g>
+
+            <!-- arrows row 1 -->
+            <line x1="164" y1="58" x2="200" y2="58" class="d-accent-line" marker-end="url(#ar-pipe)"/>
+            <line x1="344" y1="58" x2="380" y2="58" class="d-accent-line" marker-end="url(#ar-pipe)"/>
+            <!-- connector down -->
+            <path d="M454,86 L454,150" class="d-accent-line" fill="none" marker-end="url(#ar-pipe)"/>
+            <!-- arrows row 2 (right to left) -->
+            <line x1="384" y1="178" x2="348" y2="178" class="d-accent-line" marker-end="url(#ar-pipe)"/>
+            <line x1="204" y1="178" x2="168" y2="178" class="d-accent-line" marker-end="url(#ar-pipe)"/>
+
+            <text x="360" y="234" text-anchor="middle" font-size="11" class="t-muted">total &#8776; 48,000 operations/second at 60 Hz &#183; under 0.1 ms per frame &#183; 0.5% of the frame budget</text>
+          </svg>
+        </div>
+        <figcaption>The full per-frame path. Phase classification is three comparisons; scoring is 100 trees of depth 8, roughly 800 comparisons. No heap allocation, no virtual dispatch, deterministic latency.</figcaption>
+      </figure>
+
+
+      <figure class="figure">
+        <div class="figure-frame" style="padding:0;overflow:hidden;border-radius:8px;">
+          <img src="assets/ml.png" alt="Skyris Editor ML grading panel showing per-phase anomaly score" style="display:block;width:100%;height:auto;">
+        </div>
+        <figcaption>The anomaly score surfaced in the Skyris Editor, synchronised to the replay timeline.</figcaption>
+      </figure>
+
+      <h2>Scoring a landing</h2>
+
+      <p>Landing is the most scrutinised phase of primary training, and it deserves treatment beyond a generic outlier score. During the descent and ground phases the pipeline computes three physically grounded sub-scores and combines them, each threshold anchored to aviation standards for the Tecnam P2002-JF.</p>
+
+      <ul class="article-list">
+        <li><strong>Sink rate at touchdown.</strong> Full marks below 120 ft/min, linearly decaying to zero at 360 ft/min. This is the dominant quality indicator, so it carries the most weight.</li>
+        <li><strong>Bank angle at touchdown.</strong> Penalised beyond 2 degrees, zero by 8 degrees. A wing-low touchdown is dangerous regardless of how gently the aircraft settles.</li>
+        <li><strong>Vertical G-load at touchdown.</strong> The hardness of the arrival, penalised beyond 1.3 g and zero by 2.5 g.</li>
+      </ul>
+
+      <pre><code>LandingScore = 0.50 * LS_sink
+             + 0.25 * LS_bank
+             + 0.25 * LS_gload</code></pre>
+
+      <p>Tested across four scenarios the weighting behaves the way an examiner would. A textbook landing scores 0.97; a firm one 0.78; a genuinely hard arrival 0.52. The instructive case is the crosswind landing: an excellent 95 ft/min sink rate, but a 4.8-degree bank at touchdown pulls the total down to 0.81. That is correct aviation judgement encoded in arithmetic, a low-bank requirement the sink rate cannot buy back.</p>
+
+      <h2>Results: the score behaves like an instructor would</h2>
+
+      <p>Run the pipeline over a full flight and the anomaly score tells a coherent story. It sits firmly positive through straight-and-level cruise, and dips negative in exactly three places: the initial taxi, both 180-degree turns, and the start of the descent. None of these is a mistake. All three present combinations of features that differ sharply from steady flight, which is precisely what the phase models were built to notice.</p>
+
+      <figure class="figure">
+        <div class="figure-frame">
+          <svg viewBox="0 0 720 300" role="img" aria-label="Anomaly score across a full flight, dipping negative during taxi, both turns, and descent onset.">
+            <!-- axes -->
+            <line x1="55" y1="90"  x2="690" y2="90"  class="d-grid d-dash"/>
+            <line x1="55" y1="170" x2="690" y2="170" class="d-line d-dash"/>
+            <line x1="55" y1="250" x2="690" y2="250" class="d-grid d-dash"/>
+            <text x="46" y="94"  text-anchor="end" font-size="10.5" class="t-muted">+1</text>
+            <text x="46" y="174" text-anchor="end" font-size="10.5" class="t-muted">0</text>
+            <text x="46" y="254" text-anchor="end" font-size="10.5" class="t-muted">&#8722;1</text>
+            <text x="20" y="170" text-anchor="middle" font-size="11" class="t-soft" transform="rotate(-90 20 170)">anomaly score</text>
+
+            <!-- phase band markers along top -->
+            <g font-size="10" class="t-muted">
+              <text x="72"  y="40" text-anchor="middle" class="s-red">taxi</text>
+              <text x="286" y="40" text-anchor="middle" class="s-amber">turn</text>
+              <text x="428" y="40" text-anchor="middle" class="s-amber">turn</text>
+              <text x="560" y="40" text-anchor="middle" class="s-red">descent</text>
+            </g>
+
+            <!-- score curve -->
+            <polyline points="60,218 99,98 176,90 254,90 260,210 286,226 318,98 383,90 396,210 428,226 460,98 512,90 525,194 577,154 603,106 641,122 680,138" class="d-accent-line" fill="none" stroke-width="2.5"/>
+
+            <!-- highlight negative dips -->
+            <g class="s-red">
+              <circle cx="60"  cy="218" r="3.5"/>
+              <circle cx="286" cy="226" r="3.5"/>
+              <circle cx="428" cy="226" r="3.5"/>
+              <circle cx="525" cy="194" r="3.5"/>
+            </g>
+
+            <text x="365" y="284" text-anchor="middle" font-size="11" class="t-muted">time along the flight  (taxi &#8594; climb &#8594; cruise &#8594; turn &#8594; cruise &#8594; turn &#8594; cruise &#8594; descent &#8594; landing)</text>
+          </svg>
+        </div>
+        <figcaption>Anomaly score across a full synthetic flight. Positive through cruise, negative during taxi, both turns, and descent onset. Push a turn past its normal bank envelope and the dip deepens further, exactly where an instructor would want to look.</figcaption>
+      </figure>
+
+      <p>Because the display score is oriented so that green is normal and red is anomalous, an instructor reads the timeline the way they read a heart monitor. And the sensitivity is graded: a normal turn dips briefly and recovers, a turn flown with excessive bank stays in the red zone longer and deeper, and an abrupt roll input produces a sharp spike at the moment of entry.</p>
+
+      <blockquote>The design goal was never a black-box number. It was a score an instructor can point at during a debrief and say: here, on final, the descent rate left the envelope that every other landing stayed inside.</blockquote>
+
+      <h2>Why it runs in real time</h2>
+
+      <p>The cost budget is unforgiving: at 60 Hz there is roughly 16.7 ms per frame, most of it spent rendering terrain and the aircraft. The ML pipeline gets a sliver, and it fits. Feature extraction is seven arithmetic operations. Phase classification is three comparisons. Scoring 100 trees of depth 8 is on the order of 800 comparisons. That totals about 48,000 operations per second, roughly <strong>0.5% of the frame budget</strong>, completing in under 0.1 ms.</p>
+
+      <p>The trick that makes this deterministic is refusing to touch the heap. Both the normalization statistics and the trained forests are stored as compile-time arrays of thresholds and feature indices. Scoring is nothing but integer comparisons and floating-point additions: no dynamic allocation, no file I/O, no virtual dispatch. Every frame costs the same, which is exactly what a render loop needs.</p>
+
+      <h2>Limitations and where it goes next</h2>
+
+      <p>The rule-based segmentation is transparent but brittle at unusual profiles such as go-arounds or aborted takeoffs, where phase boundaries blur; a learned phase model with soft assignments would degrade more gracefully. The forests also assume the reference corpus is genuinely nominal, so contamination in the training flights raises the tolerance silently. And the models are trained offline and frozen, so they do not yet adapt to an individual cadet or a specific airframe.</p>
+
+      <p>Two of these point at the same fix. A benchmark with known, injected anomalies lets you measure detection instead of merely inspecting it, and lets you tune tolerance against ground truth rather than assumption. That is the motivation behind <a href="../index.html#projects">FLARES</a>, a synthetic-to-real benchmark validated against a real Cessna 172 dataset. The other, online per-cadet adaptation, would let the system distinguish "anomalous versus the expected flight" from "anomalous versus this student", which is the more useful signal for tracking a trainee's progress over weeks.</p>
+
+    </div>
+
+  </article>
+
+  <footer>
+    <p><a href="index.html">&larr; More writing</a></p>
+    <p>&copy; 2026 Georgios Kiritsis &middot; <a href="mailto:georgekiritsis5@gmail.com">georgekiritsis5@gmail.com</a></p>
+  </footer>
+
+</div>
+
+<script>
+  const toggle = document.getElementById('theme-toggle');
+  toggle.addEventListener('click', function() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  });
+</script>
+
+</body>
+</html>
